@@ -1,76 +1,48 @@
-# Concurrent Thread-Safe Memory Allocator
+# Concurrent Lock-Free Skip List in C++20
 
-A C++17 memory allocator built around thread-local caching and a sharded central arena, designed to reduce lock contention under heavy multi-threaded workloads.
+Skip list with lock-free concurrent insert, remove, and search operations. Uses mark bits packed into the `next` pointers for logical deletion (Harris-Herlihy-Shavit style) and hazard pointers for safe memory reclamation without locks or GC.
 
-## Design
+## Core Algorithms
 
-**Size Classes**  
-36 size classes from 8 to 8192 bytes with progressively coarser granularity. Allocations map to the nearest class in O(1) using a lookup table. Anything above 8 KB goes directly to the OS.
+**Logical Deletion**  
+When removing a node, the bottom bit of each `next[i]` pointer is atomically set to 1 (mark bit). Marked nodes are invisible to concurrent searches and are physically unlinked during the next `locate()` traversal that passes through them.
 
-**Thread Cache**  
-Each thread has a private `ThreadCache` holding per-class free lists (no locks). Allocation pulls from the local bin; deallocation pushes back. When a bin exceeds its watermark, half the blocks flush to the central arena. When empty, a batch is pulled from the arena.
+**Hazard Pointers**  
+Before dereferencing any shared pointer, a thread publishes it to its hazard slot (`HP_SLOTS = 3` per thread, `MAX_THREADS = 128`). Retired nodes go into a per-thread retire list and are only `delete`d after confirming no other thread has them hazard-protected. Reclamation triggers when the retire list reaches `RETIRE_THRESHOLD`.
 
-**Central Arena**  
-One `CentralClassArena` per size class backed by a mutex-protected free list. Each class grows by allocating a 64 KB span from the OS and slicing it into blocks. Cross-thread deallocation lands here.
+**Level Distribution**  
+Each node picks a height using a geometric distribution (coin flip per level, up to `MAXLVL = 16`). This gives expected O(log n) search time.
 
-**Large Allocations**  
-Requests over 8 KB bypass the cache entirely. The arena calls `VirtualAlloc`/`mmap` directly, prefixes the allocation with a span header, and frees it with `VirtualFree`/`munmap`.
+**Baseline**  
+`LockedSkipList` wraps `std::map` with a single `std::mutex`. The benchmark compares throughput and latency percentiles between the lock-free version and this coarse-grained locked baseline.
 
 ## Build
 
-### CMake
 ```sh
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 ```
 
-### Make (Linux/macOS)
+Or with make:
 ```sh
 make
 ```
 
-## Usage
+## Run
 
-```cpp
-#include "allocator.h"
-
-void* p = my_malloc(256);
-my_free(p);
-
-void* arr = my_calloc(100, sizeof(int));
-arr = my_realloc(arr, 200 * sizeof(int));
-my_free(arr);
-```
-
-Or through the C++ interface:
-```cpp
-void* p = cultus::Allocator::allocate(128);
-cultus::Allocator::deallocate(p);
-```
-
-## Tests
 ```sh
 ./test_correctness
-```
-Covers: basic alloc/free, calloc zeroing, realloc data preservation, 10K single-thread stress, 8-thread concurrent stress, cross-thread producer-consumer free.
-
-## Benchmark
-```sh
 ./benchmark
 ```
-Prints throughput (Mops/s) and speedup versus system `malloc` at 1, 2, 4, and 8 threads.
 
-## File Layout
+## Files
+
 ```
 include/
-  allocator.h       public C and C++ API
-  common.h          size classes, OS page primitives, constants
-src/
-  common.cpp        size class table, lookup init, OS alloc/free
-  arena.h/cpp       central arena, span management
-  thread_cache.h/cpp  per-thread cache, refill, flush
-  allocator.cpp     API wrappers
+  hazard.hpp          per-thread hazard pointer table
+  skiplist.hpp        lock-free skip list (header-only)
+  locked_baseline.hpp coarse-grained locked baseline
 tests/
   test_correctness.cpp
 benchmarks/
@@ -79,9 +51,6 @@ CMakeLists.txt
 Makefile
 ```
 
-## Platform Support
+## Memory Model
 
-| Platform | Memory Backend |
-|----------|---------------|
-| Windows  | VirtualAlloc / VirtualFree |
-| Linux / macOS | mmap / munmap |
+All CAS operations on `next` pointers use `memory_order_release` for the success case and `memory_order_relaxed` for failure. Loads use `memory_order_acquire`. The linearization point for insert is the successful CAS on `next[0]`; for remove it is the CAS that sets the mark bit on `next[0]`.

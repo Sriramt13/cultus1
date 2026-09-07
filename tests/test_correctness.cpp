@@ -1,94 +1,128 @@
-#include "../include/allocator.h"
+#include "../include/skiplist.hpp"
 #include <iostream>
 #include <thread>
 #include <vector>
 #include <atomic>
 #include <cassert>
-#include <cstring>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <set>
 #include <mutex>
-#include <queue>
 #include <condition_variable>
+#include <queue>
 
-static void test_basic() {
-    void* p1 = my_malloc(8);
-    void* p2 = my_malloc(128);
-    void* p3 = my_malloc(4096);
-    void* p4 = my_malloc(9000);
-    assert(p1 && p2 && p3 && p4);
-    my_free(p1); my_free(p2); my_free(p3); my_free(p4);
-    std::cout << "[pass] basic alloc/free\n";
-}
-
-static void test_calloc() {
-    void* p = my_calloc(16, 64);
-    assert(p);
-    unsigned char* b = (unsigned char*)p;
-    for (int i = 0; i < 16 * 64; i++) assert(b[i] == 0);
-    my_free(p);
-    std::cout << "[pass] calloc zeroed\n";
-}
-
-static void test_realloc() {
-    void* p = my_malloc(64);
-    assert(p);
-    memset(p, 0xAB, 64);
-    p = my_realloc(p, 256);
-    assert(p);
-    unsigned char* b = (unsigned char*)p;
-    for (int i = 0; i < 64; i++) assert(b[i] == 0xAB);
-    my_free(p);
-    std::cout << "[pass] realloc data preserved\n";
-}
-
-static void test_stress_single() {
-    std::vector<void*> ptrs;
-    ptrs.reserve(10000);
-    for (int i = 0; i < 10000; i++) {
-        size_t sz = (size_t)(rand() % 8192) + 1;
-        ptrs.push_back(my_malloc(sz));
-        assert(ptrs.back());
+static void check(bool cond, const char* msg) {
+    if (!cond) {
+        std::cerr << "[FAIL] " << msg << "\n";
+        std::exit(1);
     }
-    for (void* p : ptrs) my_free(p);
-    std::cout << "[pass] single-thread stress\n";
 }
 
-static void test_concurrent() {
-    constexpr int THREADS = 8;
-    constexpr int OPS     = 50000;
-    std::atomic<int> errors{0};
+static void sequential_ops() {
+    cultus::SkipList<int, int> sl;
 
-    auto worker = [&]() {
-        std::vector<void*> ptrs;
-        ptrs.reserve(OPS);
-        for (int i = 0; i < OPS; i++) {
-            size_t sz = (size_t)(rand() % 4096) + 1;
-            void* p = my_malloc(sz);
-            if (!p) { errors++; continue; }
-            memset(p, 0x5A, sz);
-            ptrs.push_back(p);
-        }
-        for (void* p : ptrs) my_free(p);
+    for (int i = 0; i < 1000; i++)
+        check(sl.insert(i, i * 2), "insert new key");
+
+    for (int i = 0; i < 1000; i++)
+        check(!sl.insert(i, 0), "duplicate insert returns false");
+
+    for (int i = 0; i < 1000; i++) {
+        auto v = sl.find(i);
+        check(v.has_value() && v.value() == i * 2, "find returns correct value");
+    }
+
+    for (int i = 0; i < 500; i++)
+        check(sl.remove(i), "remove existing");
+
+    for (int i = 0; i < 500; i++)
+        check(!sl.contains(i), "removed key absent");
+
+    for (int i = 500; i < 1000; i++)
+        check(sl.contains(i), "unremoved key present");
+
+    check(!sl.remove(9999), "remove missing returns false");
+    check(!sl.find(9999).has_value(), "find missing returns nullopt");
+
+    std::cout << "[pass] sequential insert/find/remove\n";
+}
+
+static void sorted_traversal() {
+    cultus::SkipList<int, int> sl;
+    std::vector<int> keys = {50, 10, 90, 3, 77, 25};
+    for (int k : keys) sl.insert(k, k);
+
+    std::vector<int> out;
+    sl.for_each([&](const int& k, const int&) { out.push_back(k); });
+
+    check(std::is_sorted(out.begin(), out.end()), "for_each sorted order");
+    std::cout << "[pass] sorted traversal\n";
+}
+
+static void concurrent_insert_no_overlap() {
+    constexpr int T  = 8;
+    constexpr int N  = 2000;
+    cultus::SkipList<int, int> sl;
+    std::atomic<int> inserted{0};
+
+    auto worker = [&](int base) {
+        for (int i = 0; i < N; i++)
+            if (sl.insert(base + i, base + i)) inserted++;
     };
 
-    std::vector<std::thread> threads;
-    for (int i = 0; i < THREADS; i++) threads.emplace_back(worker);
-    for (auto& t : threads) t.join();
-    assert(errors.load() == 0);
-    std::cout << "[pass] concurrent alloc/free (" << THREADS << " threads)\n";
+    std::vector<std::thread> pool;
+    for (int t = 0; t < T; t++) pool.emplace_back(worker, t * N);
+    for (auto& th : pool) th.join();
+
+    check(inserted.load() == T * N, "all disjoint inserts succeed");
+    std::cout << "[pass] concurrent insert no-overlap (" << T << " threads)\n";
 }
 
-static void test_producer_consumer() {
-    std::queue<void*>       q;
-    std::mutex              mu;
+static void concurrent_mixed() {
+    constexpr int T   = 8;
+    constexpr int OPS = 10000;
+    cultus::SkipList<int, int> sl;
+
+    for (int i = 0; i < 500; i++) sl.insert(i, i);
+
+    std::atomic<int> errors{0};
+    auto worker = [&]() {
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<int> kd(0, 999);
+        std::uniform_int_distribution<int> od(0, 2);
+        for (int i = 0; i < OPS; i++) {
+            int k = kd(rng);
+            switch (od(rng)) {
+                case 0: sl.insert(k, k);  break;
+                case 1: sl.remove(k);     break;
+                case 2: sl.contains(k);   break;
+            }
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < T; t++) pool.emplace_back(worker);
+    for (auto& th : pool) th.join();
+
+    check(errors.load() == 0, "no errors in mixed concurrent ops");
+    std::cout << "[pass] concurrent mixed ops (" << T << " threads)\n";
+}
+
+static void producer_consumer() {
+    cultus::SkipList<int, int> sl;
+    std::queue<int*>      q;
+    std::mutex            mu;
     std::condition_variable cv;
-    std::atomic<bool>       done{false};
+    std::atomic<bool>     done{false};
 
     auto producer = [&]() {
         for (int i = 0; i < 20000; i++) {
-            void* p = my_malloc(64);
-            if (!p) continue;
-            std::lock_guard<std::mutex> lock(mu);
-            q.push(p);
+            sl.insert(i, i);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                q.push(new int(i));
+            }
             cv.notify_one();
         }
         done = true;
@@ -97,29 +131,53 @@ static void test_producer_consumer() {
 
     auto consumer = [&]() {
         while (true) {
-            std::unique_lock<std::mutex> lock(mu);
-            cv.wait(lock, [&]{ return !q.empty() || done; });
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&]{ return !q.empty() || done; });
             while (!q.empty()) {
-                void* p = q.front(); q.pop();
-                lock.unlock();
-                my_free(p);
-                lock.lock();
+                int* key = q.front(); q.pop();
+                lk.unlock();
+                sl.remove(*key);
+                delete key;
+                lk.lock();
             }
             if (done && q.empty()) break;
         }
     };
 
-    std::thread prod(producer), cons(consumer);
-    prod.join(); cons.join();
-    std::cout << "[pass] producer-consumer cross-thread free\n";
+    std::thread p(producer), c(consumer);
+    p.join(); c.join();
+
+    std::cout << "[pass] producer-consumer cross-thread remove\n";
+}
+
+static void stress_insert_remove() {
+    constexpr int T   = 6;
+    constexpr int OPS = 20000;
+    cultus::SkipList<int, int> sl;
+
+    auto worker = [&](int seed) {
+        std::mt19937 rng(seed);
+        std::uniform_int_distribution<int> kd(0, 1 << 16);
+        for (int i = 0; i < OPS; i++) {
+            int k = kd(rng);
+            if (i % 3 == 0) sl.remove(k);
+            else             sl.insert(k, k);
+        }
+    };
+
+    std::vector<std::thread> pool;
+    for (int t = 0; t < T; t++) pool.emplace_back(worker, t * 997);
+    for (auto& th : pool) th.join();
+
+    std::cout << "[pass] heavy insert/remove stress (" << T << " threads)\n";
 }
 
 int main() {
-    test_basic();
-    test_calloc();
-    test_realloc();
-    test_stress_single();
-    test_concurrent();
-    test_producer_consumer();
+    sequential_ops();
+    sorted_traversal();
+    concurrent_insert_no_overlap();
+    concurrent_mixed();
+    producer_consumer();
+    stress_insert_remove();
     std::cout << "\nAll tests passed.\n";
 }
